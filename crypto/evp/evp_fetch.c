@@ -351,11 +351,19 @@ inner_evp_generic_fetch(struct evp_method_data_st *methdata,
             if (name_id == 0) {
                 ERR_raise_data(ERR_LIB_EVP, ERR_R_FETCH_FAILED,
                     "Algorithm %s cannot be found", name != NULL ? name : "<null>");
+#ifdef OPENSSL_NO_CACHED_FETCH
                 free_method(method);
+#endif
                 method = NULL;
             } else {
                 meth_id = evp_method_id(name_id, operation_id);
-                if (meth_id != 0)
+                /*
+                 * do not insert method to method store cache when provider
+                 * did ask for not caching it. methods which are not to be
+                 * cached end up in ->tmp_store when provider asks not
+                 * to cache the result (see ossl_method_construct_reserve_store())
+                 */
+                if (meth_id != 0 && methdata->tmp_store == NULL)
                     ossl_method_store_cache_set(store, prov, meth_id, propq,
                         method, up_ref_method, free_method);
             }

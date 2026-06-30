@@ -46,7 +46,7 @@ static int qc_init(SSL *qconn, BIO_ADDR *dst_addr);
     && defined(OPENSSL_NO_BROTLI) && defined(OPENSSL_NO_ZSTD)     \
     && !defined(OPENSSL_NO_ECX) && !defined(OPENSSL_NO_DH)        \
     && !defined(OPENSSL_NO_ML_DSA) && !defined(OPENSSL_NO_ML_KEM) \
-    && !defined(OPENSSL_NO_SM2)
+    && !defined(OPENSSL_NO_SLH_DSA) && !defined(OPENSSL_NO_SM2)
 #define DO_SSL_TRACE_TEST
 #endif
 
@@ -1705,12 +1705,12 @@ static int test_bw_limit(void)
                     sendlen > TEST_SINGLE_WRITE_SIZE ? TEST_SINGLE_WRITE_SIZE
                                                      : sendlen,
                     &written)) {
-                TEST_info("Retrying to send: %llu", (unsigned long long)sendlen);
+                TEST_info("Retrying to send: %zu", sendlen);
                 if (!TEST_int_eq(SSL_get_error(clientquic, 0), SSL_ERROR_WANT_WRITE))
                     goto err;
             } else {
                 sendlen -= written;
-                TEST_info("Remaining to send: %llu", (unsigned long long)sendlen);
+                TEST_info("Remaining to send: %zu", sendlen);
             }
         } else {
             SSL_handle_events(clientquic);
@@ -1722,9 +1722,9 @@ static int test_bw_limit(void)
                 &readbytes)
             && readbytes > 1) {
             recvlen -= readbytes;
-            TEST_info("Remaining to recv: %llu", (unsigned long long)recvlen);
+            TEST_info("Remaining to recv: %zu", recvlen);
         } else {
-            TEST_info("No progress on recv: %llu", (unsigned long long)recvlen);
+            TEST_info("No progress on recv: %zu", recvlen);
         }
         ossl_quic_tserver_tick(qtserv);
     }
@@ -3563,6 +3563,29 @@ end:
     return ret;
 }
 
+static int test_ssl_new_mfail(void)
+{
+    int ret = 0;
+    SSL_CTX *cctx = NULL;
+    SSL *clientquic = NULL;
+
+    if (!TEST_ptr(cctx = SSL_CTX_new_ex(libctx, NULL, OSSL_QUIC_client_method())))
+        goto err;
+
+    MFAIL_start();
+    clientquic = SSL_new(cctx);
+    MFAIL_end();
+
+    if (clientquic != NULL)
+        ret = 1;
+
+err:
+    SSL_free(clientquic);
+    SSL_CTX_free(cctx);
+
+    return ret;
+}
+
 /***********************************************************************************/
 OPT_TEST_DECLARE_USAGE("provider config certsdir datadir\n")
 
@@ -3675,6 +3698,11 @@ int setup_tests(void)
     ADD_TEST(test_quic_peer_addr_v4);
     ADD_TEST(test_ech);
     ADD_TEST(test_quic_resize_txe);
+#ifdef OPENSSL_NO_CACHED_FETCH
+    ADD_MFAIL_NO_CHECK_TEST(test_ssl_new_mfail);
+#else
+    ADD_MFAIL_TEST(test_ssl_new_mfail);
+#endif
 
     return 1;
 err:

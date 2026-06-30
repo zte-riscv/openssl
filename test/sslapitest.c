@@ -136,6 +136,7 @@ static const char *ocsp_signer_cert = "subinterCA.pem";
     && defined(OPENSSL_NO_BROTLI) && defined(OPENSSL_NO_ZSTD)     \
     && !defined(OPENSSL_NO_ECX) && !defined(OPENSSL_NO_DH)        \
     && !defined(OPENSSL_NO_ML_DSA) && !defined(OPENSSL_NO_ML_KEM) \
+    && !defined(OPENSSL_NO_SLH_DSA)                               \
     && !defined(OPENSSL_NO_TLS1_3) && !defined(OPENSSL_NO_SM2)
 #define DO_SSL_TRACE_TEST
 #endif
@@ -2518,11 +2519,11 @@ static int test_tlsext_status_type_multi(void)
     if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(), TLS_client_method(),
             TLS1_VERSION, 0, &sctx, &cctx, leaf, skey)))
         goto end;
-    if (TEST_int_lt(SSL_CTX_use_certificate_chain_file(sctx, leaf_chain), 0))
+    if (!TEST_int_ge(SSL_CTX_use_certificate_chain_file(sctx, leaf_chain), 0))
         goto end;
     if (!TEST_true(SSL_CTX_load_verify_locations(cctx, root, NULL)))
         goto end;
-    if (TEST_int_ne(SSL_CTX_get_tlsext_status_type(cctx), -1))
+    if (!TEST_int_eq(SSL_CTX_get_tlsext_status_type(cctx), -1))
         goto end;
 
     /* set verify callback function */
@@ -12036,7 +12037,7 @@ static int test_no_shared_ffdhe_group(int idx)
      * Note that the server should not select the DHE ciphersuite if there are
      * no shared FFDHE groups, so if it was selected, that is an error.
      */
-    if (TEST_int_eq(TLS1_CK_DHE_RSA_WITH_AES_128_SHA256,
+    if (!TEST_int_ne(TLS1_CK_DHE_RSA_WITH_AES_128_SHA256,
             SSL_CIPHER_get_id(SSL_get_current_cipher(clientssl))))
         goto end;
 

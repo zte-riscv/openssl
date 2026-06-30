@@ -69,6 +69,9 @@ int ASN1_mbstring_ncopy(ASN1_STRING **out, const unsigned char *in, int len,
     if (len < 0) {
         ERR_raise(ERR_LIB_ASN1, ERR_R_PASSED_INVALID_ARGUMENT);
         return -1;
+    } else if (len >= INT_MAX) {
+        ERR_raise(ERR_LIB_ASN1, ASN1_R_STRING_TOO_LONG);
+        return -1;
     }
 
     /* First do a string check and work out the number of characters */
@@ -187,11 +190,27 @@ int ASN1_mbstring_ncopy(ASN1_STRING **out, const unsigned char *in, int len,
         break;
 
     case MBSTRING_BMP:
+        if (nchar > INT_MAX / 2) {
+            ERR_raise(ERR_LIB_ASN1, ASN1_R_STRING_TOO_LONG);
+            if (free_out) {
+                ASN1_STRING_free(dest);
+                *out = NULL;
+            }
+            return -1;
+        }
         outlen = nchar << 1;
         cpyfunc = cpy_bmp;
         break;
 
     case MBSTRING_UNIV:
+        if (nchar > INT_MAX / 4) {
+            ERR_raise(ERR_LIB_ASN1, ASN1_R_STRING_TOO_LONG);
+            if (free_out) {
+                ASN1_STRING_free(dest);
+                *out = NULL;
+            }
+            return -1;
+        }
         outlen = nchar << 2;
         cpyfunc = cpy_univ;
         break;
@@ -199,8 +218,11 @@ int ASN1_mbstring_ncopy(ASN1_STRING **out, const unsigned char *in, int len,
     case MBSTRING_UTF8:
         outlen = 0;
         ret = traverse_string(in, len, inform, out_utf8, &outlen);
-        if (ret < 0) {
-            ERR_raise(ERR_LIB_ASN1, ASN1_R_INVALID_UTF8STRING);
+        if (ret < 0) { /* error already raised in out_utf8() */
+            if (free_out) {
+                ASN1_STRING_free(dest);
+                *out = NULL;
+            }
             return -1;
         }
         cpyfunc = cpy_utf8;
@@ -281,9 +303,15 @@ static int out_utf8(uint32_t value, void *arg)
     int *outlen, len;
 
     len = ossl_utf8_putc_internal(NULL, -1, value);
-    if (len <= 0)
+    if (len <= 0) {
+        ERR_raise(ERR_LIB_ASN1, ASN1_R_INVALID_UTF8STRING);
         return len;
+    }
     outlen = arg;
+    if (*outlen >= INT_MAX - len) {
+        ERR_raise(ERR_LIB_ASN1, ASN1_R_STRING_TOO_LONG);
+        return -1;
+    }
     *outlen += len;
     return 1;
 }

@@ -3414,6 +3414,49 @@ static int test_set_get_raw_keys(int tst)
         && test_set_get_raw_keys_int(tst, 1, 1);
 }
 
+static int test_set_get_raw_keys_mfail(int idx)
+{
+    const uint8_t *in;
+    size_t inlen, len = 0;
+    EVP_PKEY *pkey = NULL;
+    unsigned char *buf = NULL;
+    unsigned char *privalloc = NULL;
+    const char *name;
+    int ok = 0;
+    int ret = 0;
+
+    name = keys[idx].name != NULL ? keys[idx].name : OBJ_nid2sn(keys[idx].type);
+    inlen = keys[idx].privlen;
+    in = keys[idx].priv;
+#ifndef OPENSSL_NO_ML_KEM
+    if (in == ml_kem_seed) {
+        if (!TEST_true(ml_kem_seed_to_priv(name, in, inlen, &privalloc, &inlen)))
+            goto err;
+        in = privalloc;
+    }
+#endif
+
+    MFAIL_start();
+    pkey = EVP_PKEY_new_raw_private_key_ex(testctx, name, NULL, in, inlen);
+    if (pkey != NULL
+        && EVP_PKEY_get_raw_private_key(pkey, NULL, &len)
+        && (buf = OPENSSL_malloc(len == 0 ? 1 : len)) != NULL
+        && EVP_PKEY_get_raw_private_key(pkey, buf, &len))
+        ok = 1;
+    MFAIL_end();
+
+    if (!ok)
+        goto err;
+
+    ret = TEST_mem_eq(in, inlen, buf, len);
+
+err:
+    OPENSSL_free(privalloc);
+    OPENSSL_free(buf);
+    EVP_PKEY_free(pkey);
+    return ret;
+}
+
 static int test_EVP_PKEY_check(int i)
 {
     int ret = 0;
@@ -4397,6 +4440,139 @@ err:
     return ret;
 }
 #endif /* !OPENSSL_NO_DEPRECATED_3_0 */
+
+/* Test that DHX (X9.42) rejects a malicious peer key during the
+ * derivation phase (specifically EVP_PKEY_derive_set_peer) when the
+ * remote 'q' does not match the local domain parameters but is still
+ * consistent with the remote key share.
+ * (CVE-2026-42770)
+ */
+static int test_dhx_derive_rejects_bad_peer_q(void)
+{
+    int ret = 0;
+    EVP_PKEY *local_key = NULL, *remote_key = NULL;
+    EVP_PKEY_CTX *pctx = NULL, *derive_ctx = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    OSSL_PARAM *params = NULL;
+
+    BIGNUM *p = NULL, *g = NULL;
+    BIGNUM *q_valid = NULL, *pub_local = NULL, *priv_local = NULL;
+    BIGNUM *q_bad = NULL, *pub_bad = NULL;
+
+    const char *hex_p = "87a8e61db4b6663cffbbd19c651959998ceef608660dd0f25d2ceed4435e3b00"
+                        "e00df8f1d61957d4faf7df4561b2aa3016c3d91134096faa3bf4296d830e9a7c"
+                        "209e0c6497517abd5a8a9d306bcf67ed91f9e6725b4758c022e0b1ef4275bf7b"
+                        "6c5bfc11d45f9088b941f54eb1e59bb8bc39a0bf12307f5c4fdb70c581b23f76"
+                        "b63acae1caa6b7902d52526735488a0ef13c6d9a51bfa4ab3ad8347796524d8e"
+                        "f6a167b5a41825d967e144e5140564251ccacb83e6b486f6b3ca3f7971506026"
+                        "c0b857f689962856ded4010abd0be621c3a3960a54e710c375f26375d7014103"
+                        "a4b54330c198af126116d2276e11715f693877fad7ef09cadb094ae91e1a1597";
+    const char *hex_g = "3FB32C9B73134D0B2E77506660EDBD484CA7B18F21EF205407F4793A1A0BA125"
+                        "10DBC15077BE463FFF4FED4AAC0BB555BE3A6C1B0C6B47B1BC3773BF7E8C6F62"
+                        "901228F8C28CBB18A55AE31341000A650196F931C77A57F2DDF463E5E9EC144B"
+                        "777DE62AAAB8A8628AC376D282D6ED3864E67982428EBC831D14348F6F2F9193"
+                        "B5045AF2767164E1DFC967C1FB3F2E55A4BD1BFFE83B9C80D052B985D182EA0A"
+                        "DB2A3B7313D3FE14C8484B1E052588B9B7D2BBD2DF016199ECD06E1557CD0915"
+                        "B3353BBB64E0EC377FD028370DF92B52C7891428CDC67EB6184B523D1DB246C3"
+                        "2F63078490F00EF8D647D148D47954515E2327CFEF98C582664B4C0F6CC41659";
+
+    const char *hex_q_valid = "8CF83642A709A097B447997640129DA299B1A47D1EB3750BA308B0FE64F5FBD3";
+    const char *hex_local_pub = "796e15431470ac86fa8a78b8bcdd1f3589dbf15ffe0e0a7a41dd8640887f3cc3"
+                                "f0439e281f4cf3800bac2dbdfcda589b26cc828512085ce0d3e57aa13cd9e7a4"
+                                "66d881bace91ed10c6064ab36e0d66367c4bfed56a9f907e4daec16732fb5c54"
+                                "891cb0d26251fd61c32040774246b3f8bdcd5ef60e6847cdd69bd6d318d1cda0"
+                                "e8a30a716de4dc1a4eb99b0686b77120c4b69b0005f6a8c3ae768d23c08c85bd"
+                                "1d58f40dc0138d6277436137ae69779fdc218c071c14826f471562033e85ffc9"
+                                "9a2147d539e274136a4a1e7f1db97583b51dc0385a52d7383963758d893398a8"
+                                "d013fdbad20ddf30fbe05fbb2249913ae6751b6b246ae5622ba26c4827417c2d";
+    const char *hex_local_priv = "1122334455667788990011223344556677889900112233445566778899001122";
+
+    /* Remote malicious parameters */
+    const char *hex_remote_q = "09f5";
+    const char *hex_remote_pub = "54c057903d362235a65c03f001d8a3ea252836b3580250abdc0a1083451af012"
+                                 "6fd150f9e8d212b384ae0c23aa7c67fe851368114ccc061a661e986bd7e63d25"
+                                 "7513339a6914cbfab209ad793ef25704cd532ddfb7e693de701d17e629ef3c18"
+                                 "4d40d5fea1f9edb89c5bf8d7aa19e3374f805932159ca7b5d573b9e2f3c94fe7"
+                                 "47c4a3b09e31afa3788d35833aaf2ac8ae8bc48500131464e793a2e0352e7c3e"
+                                 "d9da9fcf89b121bc1cee83c544214ceb3338b14ac6891968351746eaf62bb517"
+                                 "eb98fc633d8d235bac37bc08e47f1851d05501949a6733965adbfe8e43f7c3b9"
+                                 "3ca7515cd6ab36d7ef26bb0fd6033abc39613e880fffc8729b03bfeaddf08833";
+
+    if (!TEST_true(BN_hex2bn(&p, hex_p)) || !TEST_true(BN_hex2bn(&g, hex_g)))
+        goto err;
+
+    if (!TEST_true(BN_hex2bn(&q_valid, hex_q_valid))
+        || !TEST_true(BN_hex2bn(&pub_local, hex_local_pub))
+        || !TEST_true(BN_hex2bn(&priv_local, hex_local_priv)))
+        goto err;
+
+    if (!TEST_ptr(bld = OSSL_PARAM_BLD_new())
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_P, p))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_Q, q_valid))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_G, g))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, pub_local))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, priv_local))
+        || !TEST_ptr(params = OSSL_PARAM_BLD_to_param(bld)))
+        goto err;
+
+    if (!TEST_ptr(pctx = EVP_PKEY_CTX_new_from_name(testctx, "DHX", testpropq))
+        || !TEST_int_gt(EVP_PKEY_fromdata_init(pctx), 0)
+        || !TEST_int_gt(EVP_PKEY_fromdata(pctx, &local_key, EVP_PKEY_KEYPAIR, params), 0))
+        goto err;
+
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    EVP_PKEY_CTX_free(pctx);
+    params = NULL;
+    bld = NULL;
+    pctx = NULL;
+
+    if (!TEST_true(BN_hex2bn(&q_bad, hex_remote_q))
+        || !TEST_true(BN_hex2bn(&pub_bad, hex_remote_pub)))
+        goto err;
+
+    if (!TEST_ptr(bld = OSSL_PARAM_BLD_new())
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_P, p))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_Q, q_bad))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_G, g))
+        || !TEST_true(OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, pub_bad))
+        || !TEST_ptr(params = OSSL_PARAM_BLD_to_param(bld)))
+        goto err;
+
+    if (!TEST_ptr(pctx = EVP_PKEY_CTX_new_from_name(testctx, "DHX", testpropq))
+        || !TEST_int_gt(EVP_PKEY_fromdata_init(pctx), 0)
+        || !TEST_int_gt(EVP_PKEY_fromdata(pctx, &remote_key, EVP_PKEY_PUBLIC_KEY, params), 0))
+        goto err;
+
+    if (!TEST_ptr(derive_ctx = EVP_PKEY_CTX_new(local_key, NULL))
+        || !TEST_int_gt(EVP_PKEY_derive_init(derive_ctx), 0))
+        goto err;
+
+    /* reject the remote key share, even if it is self-consistent, correct
+     * code needs to use local q, not remote-provided q. */
+    if (!TEST_int_le(EVP_PKEY_derive_set_peer(derive_ctx, remote_key), 0)) {
+        TEST_error("EVP_PKEY_derive_set_peer incorrectly accepted a peer with malicious 'q'");
+        goto err;
+    }
+
+    ret = 1;
+
+err:
+    BN_free(p);
+    BN_free(g);
+    BN_free(q_valid);
+    BN_free(pub_local);
+    BN_free(priv_local);
+    BN_free(q_bad);
+    BN_free(pub_bad);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    EVP_PKEY_CTX_free(pctx);
+    EVP_PKEY_CTX_free(derive_ctx);
+    EVP_PKEY_free(local_key);
+    EVP_PKEY_free(remote_key);
+    return ret;
+}
 #endif /* !OPENSSL_NO_DH */
 
 /*
@@ -5535,6 +5711,224 @@ err:
     EVP_CIPHER_CTX_free(ctx_onestep);
     return testresult;
 }
+
+/*-
+ * A zero-length AEAD message driven through the one-shot EVP_Cipher() interface
+ * must agree with the streaming EVP_CipherFinal_ex() path. This checks:
+ * - an empty message yields the same tag via both interfaces
+ * - the true tag passes verification on decrypt
+ * - the modified tag fails verification on decrypt
+ */
+static int test_evp_oneshot_aead_zerolen(int idx)
+{
+    const EVP_CIPHER_TEST_INFO *info = &cipher_list[idx];
+    EVP_CIPHER_CTX *ctx_stream = NULL; /* reference: final only */
+    EVP_CIPHER_CTX *ctx_oneshot = NULL; /* encrypt via EVP_Cipher(in == NULL) */
+    EVP_CIPHER_CTX *ctx_dec = NULL; /* decrypt via EVP_Cipher(in == NULL) */
+    EVP_CIPHER_CTX *ctx_dec_bad = NULL; /* decrypt with a corrupted tag */
+    EVP_CIPHER_CTX *ctx_dec_s = NULL; /* streaming decrypt */
+    EVP_CIPHER_CTX *ctx_dec_s_bad = NULL; /* streaming decrypt, corrupted tag */
+
+    OSSL_PARAM get_tagparams[2];
+    OSSL_PARAM set_tagparams[2];
+
+    int taglen = info->taglen;
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
+
+    unsigned char ct[16] = { 0 }; /* scratch out; AEAD finalize writes no data */
+    int finlen = 0, oneshot_flen = 0, dec_flen = 0;
+
+    unsigned char tag_stream[EVPTEST_TAG_LEN_MAX] = { 0 };
+    unsigned char tag_oneshot[EVPTEST_TAG_LEN_MAX] = { 0 };
+    unsigned char tag_bad[EVPTEST_TAG_LEN_MAX] = { 0 };
+
+    int i = 0, testresult = 1;
+    char *errmsg = NULL;
+
+    /* filter out various modes */
+    if (info->taglen == 0
+        || info->mode == EVP_CIPH_CCM_MODE
+        || info->mode == EVP_CIPH_OCB_MODE
+        || info->mode == EVP_CIPH_GCM_SIV_MODE
+        /* skip TLS stitched MTE cipher */
+        || EVP_CIPHER_is_a(info->ciph, "AES-128-CBC-HMAC-SHA1")
+        /* skip TLS stitched MTE cipher */
+        || EVP_CIPHER_is_a(info->ciph, "AES-256-CBC-HMAC-SHA1")
+        /* skip TLS stitched MTE cipher */
+        || EVP_CIPHER_is_a(info->ciph, "AES-128-CBC-HMAC-SHA256")
+        /* skip TLS stitched MTE cipher */
+        || EVP_CIPHER_is_a(info->ciph, "AES-256-CBC-HMAC-SHA256")
+        || EVP_CIPHER_is_a(info->ciph, "ChaCha20-Poly1305"))
+        return 1;
+
+    for (i = 0; i < info->keylen && i < (int)sizeof(key); i++)
+        key[i] = (unsigned char)(0xA0 + i);
+    for (i = 0; i < info->ivlen && i < (int)sizeof(iv); i++)
+        iv[i] = (unsigned char)(0xB0 + i);
+
+    /* reference: streaming finalize of an empty message */
+    if (!TEST_ptr(ctx_stream = EVP_CIPHER_CTX_new())) {
+        errmsg = "STREAM_ALLOC";
+        goto err;
+    }
+    if (!TEST_true(EVP_EncryptInit_ex2(ctx_stream, info->ciph, key, iv, NULL))) {
+        errmsg = "STREAM_INIT";
+        goto err;
+    }
+    if (!TEST_true(EVP_EncryptFinal_ex(ctx_stream, ct, &finlen))) {
+        errmsg = "STREAM_FINAL";
+        goto err;
+    }
+
+    /* clamp to the negotiated tag length if the cipher reports one */
+    i = EVP_CIPHER_CTX_get_tag_length(ctx_stream);
+    if (i > 0)
+        taglen = i;
+
+    /* bound the memcpy, should never happen but helps static analysis */
+    if (taglen > EVPTEST_TAG_LEN_MAX) {
+        errmsg = "TAGLEN_EXCEEDS_BUF";
+        goto err;
+    }
+
+    get_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_stream, taglen);
+    get_tagparams[1] = OSSL_PARAM_construct_end();
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_stream, get_tagparams))) {
+        errmsg = "STREAM_GET_TAG";
+        goto err;
+    }
+
+    /* one-shot encrypt: finalize the empty message with in == NULL */
+    if (!TEST_ptr(ctx_oneshot = EVP_CIPHER_CTX_new())) {
+        errmsg = "ONESHOT_ALLOC";
+        goto err;
+    }
+    if (!TEST_true(EVP_EncryptInit_ex2(ctx_oneshot, info->ciph, key, iv, NULL))) {
+        errmsg = "ONESHOT_INIT";
+        goto err;
+    }
+    oneshot_flen = EVP_Cipher(ctx_oneshot, ct, NULL, 0);
+    if (!TEST_int_ge(oneshot_flen, 0)) {
+        errmsg = "ONESHOT_FINAL_NULL";
+        goto err;
+    }
+
+    get_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_oneshot, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_oneshot, get_tagparams))) {
+        errmsg = "ONESHOT_GET_TAG";
+        goto err;
+    }
+    if (!TEST_mem_eq(tag_oneshot, taglen, tag_stream, taglen)) {
+        errmsg = "TAG_MISMATCH_ONESHOT_vs_STREAM";
+        goto err;
+    }
+
+    /* one-shot decrypt: the correct tag must verify via in == NULL */
+    if (!TEST_ptr(ctx_dec = EVP_CIPHER_CTX_new())) {
+        errmsg = "DEC_ALLOC";
+        goto err;
+    }
+    if (!TEST_true(EVP_DecryptInit_ex2(ctx_dec, info->ciph, key, iv, NULL))) {
+        errmsg = "DEC_INIT";
+        goto err;
+    }
+    set_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_stream, taglen);
+    set_tagparams[1] = OSSL_PARAM_construct_end();
+    if (!TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec, set_tagparams))) {
+        errmsg = "DEC_SET_TAG";
+        goto err;
+    }
+    dec_flen = EVP_Cipher(ctx_dec, ct, NULL, 0);
+    if (!TEST_int_ge(dec_flen, 0)) {
+        errmsg = "DEC_VERIFY_NULL";
+        goto err;
+    }
+
+    /*
+     * ...and a corrupted tag must be rejected. EVP_Cipher() returns < 0 on a
+     * failed one-shot, so a non-negative result here means verification was
+     * skipped or wrongly accepted the bad tag.
+     */
+    memcpy(tag_bad, tag_stream, taglen);
+    tag_bad[0] ^= 0x01;
+    if (!TEST_ptr(ctx_dec_bad = EVP_CIPHER_CTX_new())) {
+        errmsg = "DEC_BAD_ALLOC";
+        goto err;
+    }
+    if (!TEST_true(EVP_DecryptInit_ex2(ctx_dec_bad, info->ciph, key, iv, NULL))) {
+        errmsg = "DEC_BAD_INIT";
+        goto err;
+    }
+    set_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_bad, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec_bad, set_tagparams))) {
+        errmsg = "DEC_BAD_SET_TAG";
+        goto err;
+    }
+    if (!TEST_int_lt(EVP_Cipher(ctx_dec_bad, ct, NULL, 0), 0)) {
+        errmsg = "DEC_BADTAG_NOT_REJECTED";
+        goto err;
+    }
+
+    /* streaming decrypt: the correct tag must verify via EVP_DecryptFinal_ex */
+    if (!TEST_ptr(ctx_dec_s = EVP_CIPHER_CTX_new())) {
+        errmsg = "DEC_STREAM_ALLOC";
+        goto err;
+    }
+    if (!TEST_true(EVP_DecryptInit_ex2(ctx_dec_s, info->ciph, key, iv, NULL))) {
+        errmsg = "DEC_STREAM_INIT";
+        goto err;
+    }
+    set_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_stream, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec_s, set_tagparams))) {
+        errmsg = "DEC_STREAM_SET_TAG";
+        goto err;
+    }
+    if (!TEST_true(EVP_DecryptFinal_ex(ctx_dec_s, ct, &finlen))) {
+        errmsg = "DEC_STREAM_VERIFY";
+        goto err;
+    }
+
+    /* streaming decrypt: a corrupted tag must be rejected */
+    if (!TEST_ptr(ctx_dec_s_bad = EVP_CIPHER_CTX_new())) {
+        errmsg = "DEC_STREAM_BAD_ALLOC";
+        goto err;
+    }
+    if (!TEST_true(EVP_DecryptInit_ex2(ctx_dec_s_bad, info->ciph, key, iv, NULL))) {
+        errmsg = "DEC_STREAM_BAD_INIT";
+        goto err;
+    }
+    set_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_bad, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec_s_bad, set_tagparams))) {
+        errmsg = "DEC_STREAM_BAD_SET_TAG";
+        goto err;
+    }
+    if (!TEST_false(EVP_DecryptFinal_ex(ctx_dec_s_bad, ct, &finlen))) {
+        errmsg = "DEC_STREAM_BADTAG_NOT_REJECTED";
+        goto err;
+    }
+
+err:
+    if (errmsg != NULL) {
+        TEST_info("test_evp_oneshot_aead_zerolen %d, %s: %s",
+            idx, errmsg, info->name);
+        testresult = 0;
+    }
+    EVP_CIPHER_CTX_free(ctx_stream);
+    EVP_CIPHER_CTX_free(ctx_oneshot);
+    EVP_CIPHER_CTX_free(ctx_dec);
+    EVP_CIPHER_CTX_free(ctx_dec_bad);
+    EVP_CIPHER_CTX_free(ctx_dec_s);
+    EVP_CIPHER_CTX_free(ctx_dec_s_bad);
+    return testresult;
+}
+
 /*
  * Verify stale key is not being used after providing a new key in multiple steps.
  * This test performs a full round of encryption and then changes the
@@ -7164,6 +7558,166 @@ static int test_aes_rc4_keylen_change_cve_2023_5363(void)
 }
 #endif
 
+static int test_aes_gcm_siv_empty_data(void)
+{
+    unsigned char key[16] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    unsigned char nonce[12] = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+        0x22, 0x33, 0x44, 0x55 };
+    unsigned char aad[33] = "this AAD was never authenticated";
+    unsigned char zero_tag[16] = { 0 };
+    unsigned char real_tag[16];
+    unsigned char out[16];
+    int outl, ret = 0;
+    EVP_CIPHER_CTX *ctx = NULL;
+    EVP_CIPHER *c = EVP_CIPHER_fetch(NULL, "AES-128-GCM-SIV", NULL);
+
+    if (c == NULL) {
+        return TEST_skip("AES-128-GCM-SIV cipher is not available");
+    }
+
+    /* Compute the CORRECT tag for (key,nonce,aad,pt="") via encrypt */
+    ctx = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(ctx)
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, c, key, nonce, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outl, aad, sizeof(aad))) /* AAD */
+        || !TEST_true(EVP_EncryptUpdate(ctx, out, &outl, aad, 0)) /* empty PT, out!=NULL */
+        || !TEST_true(EVP_EncryptFinal_ex(ctx, out, &outl))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, real_tag)))
+        goto err;
+    EVP_CIPHER_CTX_free(ctx);
+
+    /* SANITY: decrypt with CORRECT tag and an explicit empty-PT Update */
+    ctx = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(ctx)
+        || !TEST_true(EVP_DecryptInit_ex2(ctx, c, key, nonce, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, real_tag))
+        || !TEST_true(EVP_DecryptUpdate(ctx, NULL, &outl, aad, sizeof(aad)))
+        || !TEST_true(EVP_DecryptUpdate(ctx, out, &outl, aad, 0)) /* force aes_gcm_siv_decrypt(len=0) */
+        || !TEST_true(EVP_DecryptFinal_ex(ctx, out, &outl)))
+        goto err;
+    EVP_CIPHER_CTX_free(ctx);
+
+    /* FORGERY A: AAD only, NO ciphertext Update, ALL-ZERO tag */
+    ctx = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(ctx)
+        || !TEST_true(EVP_DecryptInit_ex2(ctx, c, key, nonce, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, zero_tag))
+        || !TEST_true(EVP_DecryptUpdate(ctx, NULL, &outl, aad, sizeof(aad))) /* AAD only, out==NULL */
+        || !TEST_false(EVP_DecryptFinal_ex(ctx, out, &outl)))
+        goto err;
+    EVP_CIPHER_CTX_free(ctx);
+
+    /* FORGERY B: no AAD, no Update at all, ALL-ZERO tag */
+    ctx = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(ctx)
+        || !TEST_true(EVP_DecryptInit_ex2(ctx, c, key, nonce, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, zero_tag))
+        || !TEST_false(EVP_DecryptFinal_ex(ctx, out, &outl)))
+        goto err;
+    EVP_CIPHER_CTX_free(ctx);
+
+    /* CONTROL: AAD only, NO ciphertext Update, CORRECT tag */
+    ctx = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(ctx)
+        || !TEST_true(EVP_DecryptInit_ex2(ctx, c, key, nonce, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, real_tag))
+        || !TEST_true(EVP_DecryptUpdate(ctx, NULL, &outl, aad, sizeof(aad)))
+        || !TEST_true(EVP_DecryptFinal_ex(ctx, out, &outl)))
+        goto err;
+    EVP_CIPHER_CTX_free(ctx);
+    ctx = NULL;
+
+    ret = 1;
+err:
+    EVP_CIPHER_CTX_free(ctx);
+
+    EVP_CIPHER_free(c);
+    return ret;
+}
+
+#if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
+static int test_chacha20_poly1305_late_aad(void)
+{
+    EVP_CIPHER_CTX *ctx = NULL;
+    EVP_CIPHER *c = NULL;
+    unsigned char key[32] = { 0 };
+    unsigned char iv[12] = { 0 };
+    unsigned char aad[4] = "aad";
+    unsigned char msg[8] = "message";
+    unsigned char out[32];
+    int len, test;
+
+    test = TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        && TEST_ptr(c = EVP_CIPHER_fetch(testctx, "ChaCha20-Poly1305", testpropq))
+        && TEST_true(EVP_EncryptInit_ex2(ctx, c, key, iv, NULL))
+        && TEST_true(EVP_EncryptUpdate(ctx, NULL, &len, aad, sizeof(aad)))
+        && TEST_true(EVP_EncryptUpdate(ctx, out, &len, msg, sizeof(msg)))
+        && TEST_false(EVP_EncryptUpdate(ctx, NULL, &len, aad, sizeof(aad)));
+
+    EVP_CIPHER_free(c);
+    EVP_CIPHER_CTX_free(ctx);
+    return test;
+}
+#endif
+/*
+ * AES-SIV reuse-without-rekey:
+ *   msg1: legit non-empty CT, tag verifies, final_ret=0
+ *   msg2: no reinit (or reinit with key=NULL), set forged tag,
+ *         AAD only, DecryptFinal -> does stale final_ret leak through?
+ */
+static int test_aes_siv_ctx_reuse(void)
+{
+    unsigned char key[32] = { 7 }; /* AES-128-SIV => 2*16 */
+    unsigned char pt[9] = "payload!";
+    unsigned char ct[9], tagbuf[16], out[16], zero16[16] = { 0 };
+    unsigned char aad[14] = "forged header";
+    int outl, ret = 0;
+    EVP_CIPHER_CTX *e = NULL, *d = NULL;
+    EVP_CIPHER *c = EVP_CIPHER_fetch(NULL, "AES-128-SIV", NULL);
+
+    if (c == NULL) {
+        return TEST_skip("AES-128-SIV cipher is not available");
+    }
+
+    /* produce a valid (ct,tag) for msg1 */
+    e = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(e)
+        || !TEST_true(EVP_EncryptInit_ex2(e, c, key, NULL, NULL))
+        || !TEST_true(EVP_EncryptUpdate(e, NULL, &outl, (unsigned char *)"hdr1", 4))
+        || !TEST_true(EVP_EncryptUpdate(e, ct, &outl, pt, sizeof(pt)))
+        || !TEST_true(EVP_EncryptFinal_ex(e, out, &outl))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(e, EVP_CTRL_AEAD_GET_TAG, 16, tagbuf))) {
+        EVP_CIPHER_CTX_free(e);
+        goto err;
+    }
+    EVP_CIPHER_CTX_free(e);
+
+    /* msg1 decrypt */
+    d = EVP_CIPHER_CTX_new();
+    if (!TEST_ptr(d)
+        || !TEST_true(EVP_DecryptInit_ex2(d, c, key, NULL, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(d, EVP_CTRL_AEAD_SET_TAG, 16, tagbuf))
+        || !TEST_true(EVP_DecryptUpdate(d, NULL, &outl, (unsigned char *)"hdr1", 4))
+        || !TEST_true(EVP_DecryptUpdate(d, out, &outl, ct, sizeof(ct)))
+        || !TEST_true(EVP_DecryptFinal_ex(d, out, &outl)))
+        goto err;
+
+    /* msg2 on SAME ctx, reinit with key=NULL => initkey skipped, final_ret should be reset */
+    if (!TEST_true(EVP_DecryptInit_ex2(d, NULL, NULL, NULL, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_ctrl(d, EVP_CTRL_AEAD_SET_TAG, 16, zero16))
+        || !TEST_true(EVP_DecryptUpdate(d, NULL, &outl, aad, sizeof(aad))) /* forged AAD */
+        || !TEST_false(EVP_DecryptFinal_ex(d, out, &outl)))
+        goto err;
+
+    ret = 1;
+
+err:
+    EVP_CIPHER_CTX_free(d);
+    EVP_CIPHER_free(c);
+    return ret;
+}
+
 static int test_invalid_ctx_for_digest(void)
 {
     int ret;
@@ -7221,6 +7775,270 @@ end:
     EVP_CIPHER_CTX_free(ctx);
     return ret;
 }
+
+/*
+ * Cross-driver round-trip test for AEAD one-shot vs streaming paths.
+ *
+ * The streaming path (EVP_CipherUpdate/Final, dispatched to
+ * OSSL_FUNC_CIPHER_UPDATE/_FINAL) is treated as the oracle.  For each
+ * AEAD configuration we encrypt and decrypt the same (key, iv, aad, pt),
+ * driving the body in two combinations:
+ *
+ *   1.  body encrypt via EVP_Cipher() (one-shot, OSSL_FUNC_CIPHER_CIPHER),
+ *       body decrypt via EVP_CipherUpdate (streaming).
+ *   2.  body encrypt via EVP_CipherUpdate, body decrypt via EVP_Cipher().
+ *
+ * Both combinations must recover the plaintext and verify the tag.  AAD
+ * is always fed via EVP_CipherUpdate(NULL, ...): OCB's one-shot is body
+ * only and the asymmetric "AAD streaming, body one-shot" call shape is
+ * the natural pattern a caller reaching for EVP_Cipher() for throughput
+ * would write anyway.
+ *
+ * CVE-2026-45445 (AES-OCB EVP_Cipher() ignored IV) was a silent failure
+ * in this matrix: the one-shot encrypt path produced ciphertext under
+ * Offset_0 = 0 regardless of IV, which the streaming decrypt path then
+ * could not verify.  Adding this cross-check catches the same class of
+ * bug for any future AEAD whose one-shot dispatch diverges from its
+ * streaming dispatch.
+ */
+typedef struct {
+    const char *name; /* EVP_CIPHER fetch name */
+    size_t keylen;
+    size_t ivlen;
+    size_t taglen;
+    int is_ccm; /* needs length-up-front + tag-before-body dance */
+} AEAD_ONESHOT_CFG;
+
+static const AEAD_ONESHOT_CFG aead_oneshot_cfgs[] = {
+    { "AES-128-GCM", 16, 12, 16, 0 },
+    { "AES-256-GCM", 32, 12, 16, 0 },
+    { "AES-128-CCM", 16, 12, 16, 1 },
+    { "AES-256-CCM", 32, 12, 16, 1 },
+    { "AES-128-OCB", 16, 12, 16, 0 },
+    { "AES-256-OCB", 32, 12, 16, 0 },
+    { "ChaCha20-Poly1305", 32, 12, 16, 0 }
+};
+
+/*
+ * Drive an encrypt or decrypt operation.  AAD always via EVP_CipherUpdate.
+ * Body via EVP_Cipher() when oneshot_body is non-zero, EVP_CipherUpdate
+ * otherwise.  On encrypt, fills *out and the caller-provided tag buffer.
+ * On decrypt, reads from in and verifies tag; returns 0 if verification
+ * fails (the test asserts the expected outcome).
+ */
+static int aead_oneshot_op(const AEAD_ONESHOT_CFG *cfg, int enc,
+    int oneshot_body, const unsigned char *key,
+    const unsigned char *iv, const unsigned char *aad,
+    size_t aad_len, const unsigned char *in, size_t in_len,
+    unsigned char *out, unsigned char *tag, const char **why)
+{
+    EVP_CIPHER_CTX *ctx = NULL;
+    EVP_CIPHER *cipher = NULL;
+    int outl = 0, tmpl = 0;
+    int ok = 0;
+    int body_rv;
+
+    *why = NULL;
+
+    if (!TEST_ptr(cipher = EVP_CIPHER_fetch(testctx, cfg->name, testpropq))) {
+        *why = "CIPHER_FETCH";
+        goto end;
+    }
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())) {
+        *why = "CTX_NEW";
+        goto end;
+    }
+    if (!TEST_true(EVP_CipherInit_ex(ctx, cipher, NULL, NULL, NULL, enc))) {
+        *why = "INIT_CIPHER";
+        goto end;
+    }
+    if (!TEST_int_gt(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                         (int)cfg->ivlen, NULL),
+            0)) {
+        *why = "SET_IVLEN";
+        goto end;
+    }
+    if (cfg->is_ccm) {
+        /* Placeholder taglen on encrypt, real tag on decrypt; both before key+iv. */
+        if (!TEST_int_gt(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                             (int)cfg->taglen, enc ? NULL : tag),
+                0)) {
+            *why = "CCM_SET_TAG";
+            goto end;
+        }
+    }
+    if (!TEST_true(EVP_CipherInit_ex(ctx, NULL, NULL, key, iv, enc))) {
+        *why = "INIT_KEY_IV";
+        goto end;
+    }
+    if (cfg->is_ccm) {
+        if (!TEST_true(EVP_CipherUpdate(ctx, NULL, &outl, NULL, (int)in_len))) {
+            *why = "CCM_LEN_DECL";
+            goto end;
+        }
+    }
+    if (aad_len > 0
+        && !TEST_true(EVP_CipherUpdate(ctx, NULL, &outl, aad, (int)aad_len))) {
+        *why = "AAD";
+        goto end;
+    }
+    if (!enc && !cfg->is_ccm
+        && !TEST_int_gt(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                            (int)cfg->taglen, tag),
+            0)) {
+        *why = "SET_TAG";
+        goto end;
+    }
+
+    if (oneshot_body) {
+        body_rv = EVP_Cipher(ctx, out, in, (unsigned int)in_len);
+        if (cfg->is_ccm && !enc) {
+            /* CCM decrypt: 0 means tag verify failed, < 0 means error. */
+            if (!TEST_int_gt(body_rv, 0)) {
+                *why = "ONESHOT_DECRYPT";
+                goto end;
+            }
+        } else {
+            if (!TEST_int_ge(body_rv, 0)) {
+                *why = "ONESHOT_BODY";
+                goto end;
+            }
+        }
+        outl = (int)in_len;
+    } else {
+        if (!TEST_true(EVP_CipherUpdate(ctx, out, &outl, in, (int)in_len))) {
+            *why = enc ? "STREAM_BODY_ENC" : "STREAM_BODY_DEC";
+            goto end;
+        }
+    }
+
+    if (!cfg->is_ccm) {
+        if (!TEST_true(EVP_CipherFinal_ex(ctx, out + outl, &tmpl))) {
+            *why = enc ? "FINAL_ENC" : "FINAL_DEC";
+            goto end;
+        }
+    }
+
+    if (enc) {
+        if (!TEST_int_gt(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
+                             (int)cfg->taglen, tag),
+                0)) {
+            *why = "GET_TAG";
+            goto end;
+        }
+    }
+    ok = 1;
+end:
+    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_free(cipher);
+    return ok;
+}
+
+/*
+ * For each AEAD row we run two AAD modes, and within each AAD mode two
+ * cross-driver round trips:
+ *
+ *   aad_mode 0:  no AAD.  Critical for catching the OCB-style bug: any
+ *                EVP_CipherUpdate(NULL, aad, ...) call before the body
+ *                would itself pass through the (correct) streaming
+ *                handler and apply the buffered IV, masking the one-shot
+ *                handler's failure to do so.  With aad_len == 0 we make
+ *                EVP_Cipher() the very first cipher operation on the
+ *                context, which is the shape the bug requires.
+ *
+ *   aad_mode 1:  with AAD via streaming.  Catches divergence between the
+ *                drivers when AAD is in play.
+ *
+ *   leg 0:       encrypt-oneshot   + decrypt-streaming
+ *   leg 1:       encrypt-streaming + decrypt-oneshot
+ *
+ * The test index encodes (cipher, aad_mode) so a failure points at both.
+ */
+static int test_aead_oneshot_roundtrip(int idx)
+{
+    static const unsigned char fixed_key[32] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+    };
+    static const unsigned char fixed_iv[12] = {
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab
+    };
+    static const unsigned char fixed_aad[] = "extra:context";
+    static const unsigned char fixed_pt[] = "THE QUICK BROWN FOX JUMPS OVER LAZY!!";
+    const AEAD_ONESHOT_CFG *cfg = &aead_oneshot_cfgs[idx / 2];
+    int with_aad = idx % 2;
+    size_t aad_len = with_aad ? sizeof(fixed_aad) - 1 : 0;
+    size_t pt_len = sizeof(fixed_pt) - 1;
+    EVP_CIPHER *probe = NULL;
+    unsigned char ct[64], pt[64];
+    unsigned char tag_oneshot[16], tag_stream[16];
+    const char *why = NULL;
+    int leg, ok = 0;
+
+    /*
+     * Probe for the cipher: a build with no-ocb / no-chacha / etc. will
+     * not have it, and we treat that as a pass (nothing to test here).
+     */
+    ERR_set_mark();
+    probe = EVP_CIPHER_fetch(testctx, cfg->name, testpropq);
+    ERR_pop_to_mark();
+    if (probe == NULL) {
+        TEST_info("skipping, '%s' is not available", cfg->name);
+        return 1;
+    }
+    EVP_CIPHER_free(probe);
+
+    for (leg = 0; leg <= 1; leg++) {
+        int enc_oneshot = (leg == 0);
+        unsigned char *tag = enc_oneshot ? tag_oneshot : tag_stream;
+
+        memset(ct, 0, sizeof(ct));
+        memset(pt, 0, sizeof(pt));
+        memset(tag, 0, cfg->taglen);
+
+        if (!aead_oneshot_op(cfg, /*enc=*/1, /*oneshot_body=*/enc_oneshot,
+                fixed_key, fixed_iv, fixed_aad, aad_len,
+                fixed_pt, pt_len, ct, tag, &why)) {
+            TEST_error("%s (%s): encrypt leg %d (%s body) failed at %s",
+                cfg->name, with_aad ? "with AAD" : "no AAD",
+                leg, enc_oneshot ? "oneshot" : "stream",
+                why ? why : "?");
+            goto end;
+        }
+        if (!aead_oneshot_op(cfg, /*enc=*/0, /*oneshot_body=*/!enc_oneshot,
+                fixed_key, fixed_iv, fixed_aad, aad_len,
+                ct, pt_len, pt, tag, &why)) {
+            TEST_error("%s (%s): decrypt leg %d (%s body) failed at %s",
+                cfg->name, with_aad ? "with AAD" : "no AAD",
+                leg, enc_oneshot ? "stream" : "oneshot",
+                why ? why : "?");
+            goto end;
+        }
+        if (!TEST_mem_eq(pt, pt_len, fixed_pt, pt_len)) {
+            TEST_error("%s (%s): leg %d: recovered plaintext differs",
+                cfg->name, with_aad ? "with AAD" : "no AAD", leg);
+            goto end;
+        }
+    }
+
+    /*
+     * Both legs share the same (key, iv, aad, pt) and must therefore
+     * agree on the tag bit-for-bit, regardless of which driver computed
+     * it.  This catches the OCB-style failure where the one-shot path
+     * silently emits a different ciphertext/tag from the streaming path.
+     */
+    if (!TEST_mem_eq(tag_oneshot, cfg->taglen, tag_stream, cfg->taglen)) {
+        TEST_error("%s (%s): oneshot-encrypt tag != streaming-encrypt tag",
+            cfg->name, with_aad ? "with AAD" : "no AAD");
+        goto end;
+    }
+    ok = 1;
+end:
+    return ok;
+}
+
 #ifndef OPENSSL_NO_DES
 static int test_EVP_CIPHER_get_type_des_ede3(void)
 {
@@ -8043,6 +8861,12 @@ int setup_tests(void)
     ADD_TEST(test_EVP_SM2_verify);
 #endif
     ADD_ALL_TESTS(test_set_get_raw_keys, OSSL_NELEM(keys));
+#if defined(_MSC_VER) || defined(OPENSSL_NO_CACHED_FETCH)
+    ADD_MFAIL_ALL_NO_CHECK_TESTS(test_set_get_raw_keys_mfail,
+        OSSL_NELEM(keys));
+#else
+    ADD_MFAIL_ALL_TESTS(test_set_get_raw_keys_mfail, OSSL_NELEM(keys));
+#endif
     ADD_ALL_TESTS(test_EVP_PKEY_check, OSSL_NELEM(keycheckdata));
 #ifndef OPENSSL_NO_CMAC
     ADD_TEST(test_CMAC_keygen);
@@ -8070,12 +8894,14 @@ int setup_tests(void)
 #endif
 #if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
     ADD_TEST(test_decrypt_null_chunks);
+    ADD_TEST(test_chacha20_poly1305_late_aad);
 #endif
 #ifndef OPENSSL_NO_DH
     ADD_TEST(test_DH_priv_pub);
 #ifndef OPENSSL_NO_DEPRECATED_3_0
     ADD_TEST(test_EVP_PKEY_set1_DH);
 #endif
+    ADD_TEST(test_dhx_derive_rejects_bad_peer_q);
 #endif
 #ifndef OPENSSL_NO_EC
     ADD_TEST(test_EC_priv_pub);
@@ -8110,6 +8936,7 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_evp_diff_order_init, cipher_list_n);
     ADD_ALL_TESTS(test_evp_stale_key_reinit, cipher_list_n);
     ADD_ALL_TESTS(test_evp_decrypt_roundtrip_multistep, cipher_list_n);
+    ADD_ALL_TESTS(test_evp_oneshot_aead_zerolen, cipher_list_n);
 
     ADD_ALL_TESTS(test_evp_init_seq, OSSL_NELEM(evp_init_tests));
     ADD_ALL_TESTS(test_evp_reset, OSSL_NELEM(evp_reset_tests));
@@ -8135,6 +8962,12 @@ int setup_tests(void)
 #ifndef OPENSSL_NO_RC4
     ADD_TEST(test_aes_rc4_keylen_change_cve_2023_5363);
 #endif
+
+    ADD_ALL_TESTS(test_aead_oneshot_roundtrip, 2 * OSSL_NELEM(aead_oneshot_cfgs));
+
+    /* Test cases for CVE-2026-45446 */
+    ADD_TEST(test_aes_gcm_siv_empty_data);
+    ADD_TEST(test_aes_siv_ctx_reuse);
 
     ADD_TEST(test_invalid_ctx_for_digest);
 
