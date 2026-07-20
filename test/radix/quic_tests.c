@@ -765,6 +765,30 @@ DEF_SCRIPT(check_ctx_cbks, "Check new_pending and client_hello callbacks")
     OP_FUNC(check_pending);
 }
 
+DEF_FUNC(check_stream_reset_5)
+{
+    int ok = 0;
+    SSL *ssl;
+    uint64_t aec = 0;
+    int state;
+
+    REQUIRE_SSL(ssl);
+
+    state = SSL_get_stream_read_state(ssl);
+    if (state != SSL_STREAM_STATE_RESET_REMOTE)
+        F_SPIN_AGAIN();
+
+    if (!TEST_true(SSL_get_stream_read_error_code(ssl, &aec)))
+        goto err;
+
+    if (!TEST_uint64_t_eq(aec, 42))
+        goto err;
+
+    ok = 1;
+err:
+    return ok;
+}
+
 /*
  * script_5 - script_106 are place holders for tests we
  * currently keep in test/quic_multistream_test.c.
@@ -778,36 +802,287 @@ DEF_SCRIPT(check_ctx_cbks, "Check new_pending and client_hello callbacks")
  * The scaffolding here hopes to avoid conflicts in 'scripts'
  * array below when more PRs will be in flight.
  */
-DEF_SCRIPT(script_5, "place holder for multistram script_5")
+
+/* 5. Test stream reset functionality */
+DEF_SCRIPT(script_5, "Test stream reset functionality")
 {
+    OP_SIMPLE_PAIR_CONN_ND();
+
+    OP_NEW_STREAM(C, Ca, 0 /* bidirectional */);
+    OP_NEW_STREAM(C, Cb, 0 /* bidirectional */);
+
+    OP_WRITE(Ca, "apple", 5);
+    OP_STREAM_RESET(Ca, 42);
+
+    OP_WRITE(Cb, "strawberry", 10);
+
+    OP_ACCEPT_CONN_WAIT_ND(L, S, 0);
+    OP_ACCEPT_STREAM_WAIT(S, Sa, 0); /* first stream = Ca */
+    OP_ACCEPT_STREAM_WAIT(S, Sb, 0); /* second stream = Cb */
+
+    /* Reset disrupts read of already-sent data */
+    OP_SELECT_SSL(0, Sa);
+    OP_FUNC(check_stream_reset_5);
+
+    OP_READ_EXPECT(Sb, "strawberry", 10);
 }
 
-DEF_SCRIPT(script_6, "place holder for multistram script_6")
+DEF_FUNC(check_stream_stopped_6)
 {
+    int ok = 0;
+    SSL *ssl;
+
+    REQUIRE_SSL(ssl);
+
+    if (SSL_get_stream_write_state(ssl) != SSL_STREAM_STATE_RESET_LOCAL)
+        F_SPIN_AGAIN();
+
+    ok = 1;
+err:
+    return ok;
 }
 
-DEF_SCRIPT(script_7, "place holder for multistrem script_7")
+/* 6. Test STOP_SENDING functionality */
+DEF_SCRIPT(script_6, "Test STOP_SENDING functionality")
 {
+    OP_SIMPLE_PAIR_CONN_ND();
+    OP_ACCEPT_CONN_WAIT_ND(L, S, 0);
+
+    OP_NEW_STREAM(S, Sa, 0 /* bidirectional */);
+    OP_WRITE(Sa, "apple", 5);
+
+    OP_ACCEPT_STREAM_WAIT(C, Ca, 0);
+    OP_UNBIND(Ca);
+    OP_ACCEPT_STREAM_NONE(C, 0);
+
+    OP_SELECT_SSL(0, Sa);
+    OP_FUNC(check_stream_stopped_6);
 }
 
-DEF_SCRIPT(script_8, "place holder for multistrem script_8")
+/* 7. Unidirectional default stream mode test (client sends first) */
+DEF_SCRIPT(script_7, "Unidirectional default stream mode (client sends first)")
 {
+    OP_SIMPLE_PAIR_CONN();
+    OP_SET_DEFAULT_STREAM_MODE(C, SSL_DEFAULT_STREAM_MODE_AUTO_UNI);
+    OP_WRITE(C, "apple", 5);
+
+    OP_ACCEPT_CONN_WAIT(L, S, 0);
+    OP_READ_EXPECT(S, "apple", 5);
+    OP_WRITE_FAIL(S);
 }
 
-DEF_SCRIPT(script_9, "place holder for multistrem script_9")
+/* 8. Unidirectional default stream mode test (server sends first) */
+DEF_SCRIPT(script_8, "Unidirectional default stream mode (server sends first)")
 {
+    OP_SIMPLE_PAIR_CONN();
+    OP_SET_DEFAULT_STREAM_MODE(C, SSL_DEFAULT_STREAM_MODE_AUTO_UNI);
+
+    OP_ACCEPT_CONN_WAIT(L, S, 0);
+    OP_NEW_STREAM(S, Sa, SSL_STREAM_FLAG_UNI);
+    OP_WRITE(Sa, "apple", 5);
+
+    OP_READ_EXPECT(C, "apple", 5);
+    OP_WRITE_FAIL(C);
 }
 
-DEF_SCRIPT(script_10, "place holder for multistrem script_10")
+/* 9. Unidirectional default stream mode test (server sends first on bidi) */
+DEF_SCRIPT(script_9, "Unidirectional default stream mode (server sends bidi first)")
 {
+    OP_SIMPLE_PAIR_CONN();
+    OP_SET_DEFAULT_STREAM_MODE(C, SSL_DEFAULT_STREAM_MODE_AUTO_UNI);
+
+    OP_ACCEPT_CONN_WAIT(L, S, 0);
+    OP_NEW_STREAM(S, Sa, 0 /* bidirectional */);
+    OP_WRITE(Sa, "apple", 5);
+
+    OP_READ_EXPECT(C, "apple", 5);
+    OP_WRITE(C, "orange", 6);
+    OP_READ_EXPECT(Sa, "orange", 6);
 }
 
-DEF_SCRIPT(script_11, "place holder for multistrem script_11")
+/* 10. Shutdown */
+DEF_SCRIPT(script_10, "Shutdown test")
 {
+    OP_SIMPLE_PAIR_CONN();
+
+    OP_WRITE(C, "apple", 5);
+    OP_ACCEPT_CONN_WAIT(L, S, 0);
+    OP_READ_EXPECT(S, "apple", 5);
+
+    OP_SHUTDOWN_WAIT(C, 0, 0, NULL);
+    OP_EXPECT_CONN_CLOSE_INFO(C, 0, 1, 0);
+    OP_EXPECT_CONN_CLOSE_INFO(S, 0, 1, 1);
 }
 
-DEF_SCRIPT(script_12, "place holder for multistrem script_12")
+/* 11. Many threads accepted on the same client connection */
+DEF_SCRIPT(script_11_child_0,
+    "child: accept stream from C, read, sleep, expect FIN")
 {
+    OP_ACCEPT_STREAM_WAIT(C, C0, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_READ_EXPECT_B(C0, "foo");
+    OP_SLEEP(10);
+    OP_EXPECT_FIN(C0);
+}
+
+DEF_SCRIPT(script_11_child_1,
+    "child: accept stream from C, read, sleep, expect FIN")
+{
+    OP_ACCEPT_STREAM_WAIT(C, C1, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_READ_EXPECT_B(C1, "foo");
+    OP_SLEEP(10);
+    OP_EXPECT_FIN(C1);
+}
+
+DEF_SCRIPT(script_11_child_2,
+    "child: accept stream from C, read, sleep, expect FIN")
+{
+    OP_ACCEPT_STREAM_WAIT(C, C2, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_READ_EXPECT_B(C2, "foo");
+    OP_SLEEP(10);
+    OP_EXPECT_FIN(C2);
+}
+
+DEF_SCRIPT(script_11_child_3,
+    "child: accept stream from C, read, sleep, expect FIN")
+{
+    OP_ACCEPT_STREAM_WAIT(C, C3, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_READ_EXPECT_B(C3, "foo");
+    OP_SLEEP(10);
+    OP_EXPECT_FIN(C3);
+}
+
+DEF_SCRIPT(script_11_child_4,
+    "child: accept stream from C, read, sleep, expect FIN")
+{
+    OP_ACCEPT_STREAM_WAIT(C, C4, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_READ_EXPECT_B(C4, "foo");
+    OP_SLEEP(10);
+    OP_EXPECT_FIN(C4);
+}
+
+DEF_SCRIPT(script_11, "Many threads accepted on the same client connection")
+{
+    OP_SIMPLE_PAIR_CONN_ND();
+    OP_ACCEPT_CONN_WAIT(L, S, 0);
+
+    OP_BIND(C0);
+    OP_BIND(C1);
+    OP_BIND(C2);
+    OP_BIND(C3);
+    OP_BIND(C4);
+    OP_BIND(Sa);
+    OP_BIND(Sb);
+    OP_BIND(Sc);
+    OP_BIND(Sd);
+    OP_BIND(Se);
+
+    OP_SPAWN_THREAD(script_11_child_0);
+    OP_SPAWN_THREAD(script_11_child_1);
+    OP_SPAWN_THREAD(script_11_child_2);
+    OP_SPAWN_THREAD(script_11_child_3);
+    OP_SPAWN_THREAD(script_11_child_4);
+
+    OP_NEW_STREAM(S, Sa, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(Sa, "foo");
+    OP_CONCLUDE(Sa);
+
+    OP_NEW_STREAM(S, Sb, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(Sb, "foo");
+    OP_CONCLUDE(Sb);
+
+    OP_NEW_STREAM(S, Sc, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(Sc, "foo");
+    OP_CONCLUDE(Sc);
+
+    OP_NEW_STREAM(S, Sd, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(Sd, "foo");
+    OP_CONCLUDE(Sd);
+
+    OP_NEW_STREAM(S, Se, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(Se, "foo");
+    OP_CONCLUDE(Se);
+    OP_SLEEP(10);
+}
+
+/* 12. Many threads initiated on the same client connection */
+DEF_SCRIPT(script_12_child_0,
+    "child: create stream on C, write, conclude")
+{
+    OP_NEW_STREAM(C, C0, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(C0, "foo");
+    OP_CONCLUDE(C0);
+}
+
+DEF_SCRIPT(script_12_child_1,
+    "child: create stream on C, write, conclude")
+{
+    OP_NEW_STREAM(C, C1, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(C1, "foo");
+    OP_CONCLUDE(C1);
+}
+
+DEF_SCRIPT(script_12_child_2,
+    "child: create stream on C, write, conclude")
+{
+    OP_NEW_STREAM(C, C2, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(C2, "foo");
+    OP_CONCLUDE(C2);
+}
+
+DEF_SCRIPT(script_12_child_3,
+    "child: create stream on C, write, conclude")
+{
+    OP_NEW_STREAM(C, C3, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(C3, "foo");
+    OP_CONCLUDE(C3);
+}
+
+DEF_SCRIPT(script_12_child_4,
+    "child: create stream on C, write, conclude")
+{
+    OP_NEW_STREAM(C, C4, OP_F_REPLACE_STREAM /* bidirectional */);
+    OP_WRITE_B(C4, "foo");
+    OP_CONCLUDE(C4);
+}
+
+DEF_SCRIPT(script_12, "Many threads initiated on the same client connection")
+{
+    OP_SIMPLE_PAIR_CONN_ND();
+    OP_ACCEPT_CONN_WAIT_ND(L, S, 0);
+
+    OP_BIND(C0);
+    OP_BIND(C1);
+    OP_BIND(C2);
+    OP_BIND(C3);
+    OP_BIND(C4);
+    OP_BIND(Sa);
+    OP_BIND(Sb);
+    OP_BIND(Sc);
+    OP_BIND(Sd);
+    OP_BIND(Se);
+
+    OP_SPAWN_THREAD(script_12_child_0);
+    OP_SPAWN_THREAD(script_12_child_1);
+    OP_SPAWN_THREAD(script_12_child_2);
+    OP_SPAWN_THREAD(script_12_child_3);
+    OP_SPAWN_THREAD(script_12_child_4);
+
+    OP_ACCEPT_STREAM_WAIT(S, Sa, OP_F_REPLACE_STREAM);
+    OP_READ_EXPECT_B(Sa, "foo");
+    OP_EXPECT_FIN(Sa);
+    OP_ACCEPT_STREAM_WAIT(S, Sb, OP_F_REPLACE_STREAM);
+    OP_READ_EXPECT_B(Sb, "foo");
+    OP_EXPECT_FIN(Sb);
+    OP_ACCEPT_STREAM_WAIT(S, Sc, OP_F_REPLACE_STREAM);
+    OP_READ_EXPECT_B(Sc, "foo");
+    OP_EXPECT_FIN(Sc);
+    OP_ACCEPT_STREAM_WAIT(S, Sd, OP_F_REPLACE_STREAM);
+    OP_READ_EXPECT_B(Sd, "foo");
+    OP_EXPECT_FIN(Sd);
+    OP_ACCEPT_STREAM_WAIT(S, Se, OP_F_REPLACE_STREAM);
+    OP_READ_EXPECT_B(Se, "foo");
+    OP_EXPECT_FIN(Se);
+    OP_SLEEP(10);
 }
 
 DEF_SCRIPT(script_13, "place holder for multistrem script_13")

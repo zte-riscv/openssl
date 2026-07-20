@@ -2550,18 +2550,6 @@ WORK_STATE tls_post_process_client_hello(SSL_CONNECTION *s, WORK_STATE wst)
             s->s3.tmp.new_cipher = s->session->cipher;
         }
 
-        /*-
-         * we now have the following setup.
-         * client_random
-         * cipher_list          - our preferred list of ciphers
-         * ciphers              - the client's preferred list of ciphers
-         * compression          - basically ignored right now
-         * ssl version is set   - sslv3
-         * s->session           - The ssl session has been setup.
-         * s->hit               - session reuse flag
-         * s->s3.tmp.new_cipher - the new cipher to use.
-         */
-
         /*
          * Call status_request callback if needed. Has to be done after the
          * certificate callbacks etc above.
@@ -3574,7 +3562,8 @@ static int tls_process_cke_gost(SSL_CONNECTION *s, PACKET *pkt)
     EVP_PKEY *client_pub_pkey = NULL, *pk = NULL;
     unsigned char premaster_secret[32];
     const unsigned char *start;
-    size_t outlen = sizeof(premaster_secret), inlen;
+    size_t outlen = sizeof(premaster_secret);
+    size_t inlen;
     unsigned long alg_a;
     GOST_KX_MESSAGE *pKX = NULL;
     const unsigned char *ptr;
@@ -3640,7 +3629,10 @@ static int tls_process_cke_gost(SSL_CONNECTION *s, PACKET *pkt)
         goto err;
     }
 
-    inlen = ASN1_STRING_length(pKX->kxBlob->value.sequence);
+    inlen = ASN1_STRING_length_ex(pKX->kxBlob->value.sequence);
+    if (inlen > INT_MAX)
+        goto err;
+
     start = ASN1_STRING_get0_data(pKX->kxBlob->value.sequence);
 
     if (EVP_PKEY_decrypt(pkey_ctx, premaster_secret, &outlen, start,
